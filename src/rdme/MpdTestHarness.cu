@@ -80,7 +80,7 @@ __global__ void __launch_bounds__(TUNE_MPD_REACTION_BLOCK_X_SIZE*TUNE_MPD_REACTI
 
 extern __global__ void __launch_bounds__(TUNE_MPD_REACTION_BLOCK_X_SIZE*TUNE_MPD_REACTION_BLOCK_Y_SIZE,1) precomp_reaction_kernel(const unsigned int* inLattice, const uint8_t * inSites, unsigned int* outLattice, const unsigned long long timestepHash, unsigned int* siteOverflowList
 #ifdef MPD_GLOBAL_S_MATRIX
- , const __restrict__ int8_t *SG, const __restrict__ uint8_t *RLG, const float* qp0, const float* qp1, const float* qp2
+ , const int8_t* __restrict__ SG, const uint8_t* __restrict__ RLG, const float* qp0, const float* qp1, const float* qp2
 #endif
 );
 

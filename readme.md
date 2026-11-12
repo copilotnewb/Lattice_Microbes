@@ -1,4 +1,14 @@
 # Portable conda build
+
+## Integer RDME memory and runtime improvements
+
+The optimized `IntMpdRdmeSolver` stores second-order propensities by reactive
+species pair, and the shared integer reaction evaluator no longer allocates
+from the device heap at each firing site. The dense propensity layout remains
+available for comparison. See [the performance and validation guide](docs/int_mpd_performance.md)
+for memory formulas, the model audit tool, CPU/CUDA compilation checks, and
+manual GPU validation. Rebuild and reinstall LM to use these source changes.
+
 ## Prerequisites
 Install Anaconda 3 if not already installed on your computer, download and follow the instructions at
 https://www.anaconda.com/

@@ -59,9 +59,9 @@
 
 #ifdef MPD_GLOBAL_S_MATRIX
 #ifdef MPD_GLOBAL_R_MATRIX
-inline __device__ float calculateReactionPropensity(const uint8_t siteType, const uint8_t * __restrict__ particles, const unsigned int reactionIndex, const uint8_t __restrict__ *RLG, const unsigned int* __restrict__ reactionOrdersG, const unsigned int* __restrict__ reactionSitesG, const unsigned int* __restrict__ D1G, const unsigned int* __restrict__ D2G, const float* __restrict__ reactionRatesG)
+inline __device__ float calculateReactionPropensity(const uint8_t siteType, const uint8_t * __restrict__ particles, const unsigned int reactionIndex, const uint8_t* __restrict__ RLG, const unsigned int* __restrict__ reactionOrdersG, const unsigned int* __restrict__ reactionSitesG, const unsigned int* __restrict__ D1G, const unsigned int* __restrict__ D2G, const float* __restrict__ reactionRatesG)
 #else
-inline __device__ float calculateReactionPropensity(const uint8_t siteType, const uint8_t * __restrict__ particles, const unsigned int reactionIndex, const uint8_t __restrict__ *RLG)
+inline __device__ float calculateReactionPropensity(const uint8_t siteType, const uint8_t * __restrict__ particles, const unsigned int reactionIndex, const uint8_t* __restrict__ RLG)
 #endif
 #else
 inline __device__ float calculateReactionPropensity(const uint8_t siteType, const uint8_t * __restrict__ particles, const unsigned int reactionIndex)
@@ -143,9 +143,9 @@ inline __device__ unsigned int checkForReaction(const unsigned int latticeIndex,
 
 #ifdef MPD_GLOBAL_S_MATRIX
 #ifdef MPD_GLOBAL_R_MATRIX
-inline __device__ unsigned int determineReactionIndex(const uint8_t siteType, const uint8_t * __restrict__ particles, const unsigned int latticeIndex, const float totalReactionPropensity, const unsigned long long timestepHash, const __restrict__ uint8_t *RLG, const unsigned int* __restrict__ reactionOrdersG, const unsigned int* __restrict__ reactionSitesG, const unsigned int* __restrict__ D1G, const unsigned int* __restrict__ D2G, const float* __restrict__ reactionRatesG)
+inline __device__ unsigned int determineReactionIndex(const uint8_t siteType, const uint8_t * __restrict__ particles, const unsigned int latticeIndex, const float totalReactionPropensity, const unsigned long long timestepHash, const uint8_t* __restrict__ RLG, const unsigned int* __restrict__ reactionOrdersG, const unsigned int* __restrict__ reactionSitesG, const unsigned int* __restrict__ D1G, const unsigned int* __restrict__ D2G, const float* __restrict__ reactionRatesG)
 #else
-inline __device__ unsigned int determineReactionIndex(const uint8_t siteType, const uint8_t * __restrict__ particles, const unsigned int latticeIndex, const float totalReactionPropensity, const unsigned long long timestepHash, const __restrict__ uint8_t *RLG)
+inline __device__ unsigned int determineReactionIndex(const uint8_t siteType, const uint8_t * __restrict__ particles, const unsigned int latticeIndex, const float totalReactionPropensity, const unsigned long long timestepHash, const uint8_t* __restrict__ RLG)
 #endif
 #else
 inline __device__ unsigned int determineReactionIndex(const uint8_t siteType, const uint8_t * __restrict__ particles, const unsigned int latticeIndex, const float totalReactionPropensity, const unsigned long long timestepHash)

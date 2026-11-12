@@ -158,7 +158,7 @@ __global__ void MPI_x_kernel(const unsigned int* inLattice, const uint8_t * inSi
 __global__ void MPI_y_kernel(const unsigned int* inLattice, const uint8_t * inSites, unsigned int* outLattice, const unsigned long long timestepHash, unsigned int* siteOverflowList);
 __global__ void MPI_z_kernel(const unsigned int* inLattice, const uint8_t * inSites, unsigned int* outLattice, const unsigned long long timestepHash, unsigned int* siteOverflowList, const unsigned int z_start);
 #ifdef MPD_GLOBAL_S_MATRIX
-__global__ void MPI_reaction_kernel(const unsigned int* inLattice, const uint8_t * inSites, unsigned int* outLattice, const unsigned long long timestepHash, unsigned int* siteOverflowList, const unsigned int z_start,   const __restrict__ int8_t *SG, const __restrict__ uint8_t *RLG);
+__global__ void MPI_reaction_kernel(const unsigned int* inLattice, const uint8_t * inSites, unsigned int* outLattice, const unsigned long long timestepHash, unsigned int* siteOverflowList, const unsigned int z_start,   const int8_t* __restrict__ SG, const uint8_t* __restrict__ RLG);
 #else
 __global__ void MPI_reaction_kernel(const unsigned int* inLattice, const uint8_t * inSites, unsigned int* outLattice, const unsigned long long timestepHash, unsigned int* siteOverflowList, const unsigned int z_start);
 #endif

@@ -48,6 +48,7 @@
 #include "cuda/lm_cuda.h"
 #include "rdme/RDMESolver.h"
 #include "rdme/CudaIntLattice.h"
+#include "rdme/SecondOrderPropensityTable.h"
 
 using lm::rdme::RDMESolver;
 using lm::rdme::Lattice;
@@ -89,6 +90,8 @@ protected:
     virtual void setLatticeData(const uint8_t* latticeData);
     virtual void computePropensities();
     virtual void copyModelsToDevice();
+    void freeReactionBuffers();
+    void freeDiffusionBuffers();
 
 #ifdef MPD_CUDA_3D_GRID_LAUNCH
     virtual void calculateXLaunchParameters(dim3 * gridSize, dim3 * threadBlockSize, const unsigned int maxXBlockSize, const unsigned int latticeXSize, const unsigned int latticeYSize, const unsigned int latticeZSize);
@@ -109,6 +112,7 @@ protected:
 
     void *       cudaOverflowList;
     cudaStream_t cudaStream;
+    int cudaDevice;
 
     uint32_t overflowTimesteps;
     uint32_t overflowListUses;
@@ -116,7 +120,9 @@ protected:
     // Stored model parameters for const memroy
     float* model_reactionRates;
     size_t zeroOrderSize, firstOrderSize, secondOrderSize;
-    float *zeroOrder, *firstOrder, *secondOrder;
+    float *zeroOrder, *firstOrder;
+    SecondOrderPropensityTable secondOrderTable;
+    SecondOrderTableView secondOrderDeviceTable;
 
 #ifdef MPD_GLOBAL_S_MATRIX
 	uint8_t *RLG;	// Device global memory pointer for RL matrix
@@ -138,6 +144,8 @@ protected:
 	float *propZeroOrder;
 	float *propFirstOrder;
 	float *propSecondOrder;
+    unsigned int *secondOrderRowsG;
+    unsigned int *secondOrderColumnsG;
 };
 
 
@@ -150,8 +158,8 @@ namespace intmpdrdme_dev {
                                             unsigned int* outLattice,
                                             const unsigned long long timestepHash,
                                             unsigned int* siteOverflowList,
-                                            const __restrict__ int8_t *SG,
-                                            const __restrict__ uint8_t *RLG,
+                                            const int8_t* __restrict__ SG,
+                                            const uint8_t* __restrict__ RLG,
                                             const unsigned int* __restrict__ reactionOrdersG,
                                             const unsigned int* __restrict__ reactionSitesG,
                                             const unsigned int* __restrict__ D1G,
@@ -159,18 +167,18 @@ namespace intmpdrdme_dev {
                                             const float* reactionRatesG,
                                             const float* __restrict__ qp0,
                                             const float* __restrict__ qp1,
-                                            const float* __restrict__ qp2);
+                                            const SecondOrderTableView secondOrderTable);
 #else
     __global__ void precomp_reaction_kernel(const unsigned int* inLattice,
                                             const uint8_t * inSites,
                                             unsigned int* outLattice,
                                             const unsigned long long timestepHash,
                                             unsigned int* siteOverflowList,
-                                            const __restrict__ int8_t *SG,
-                                            const __restrict__ uint8_t *RLG,
+                                            const int8_t* __restrict__ SG,
+                                            const uint8_t* __restrict__ RLG,
                                             const float* __restrict__ qp0,
                                             const float* __restrict__ qp1,
-                                            const float* __restrict__ qp2);
+                                            const SecondOrderTableView secondOrderTable);
 #endif
 #endif
 

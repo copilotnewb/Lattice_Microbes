@@ -46,7 +46,7 @@
 #error "Must define the maximum size of overflow particle list."
 #endif
 
-#define MPD_OVERFLOW_LIST_SIZE       1+2*TUNE_MPD_MAX_PARTICLE_OVERFLOWS*sizeof(uint32_t)
+#define MPD_OVERFLOW_LIST_SIZE       ((1+2*TUNE_MPD_MAX_PARTICLE_OVERFLOWS)*sizeof(uint32_t))
 
 #define MPD_PARTICLES_PER_SITE  MPD_WORDS_PER_SITE*4
 #if MPD_PARTICLES_PER_SITE <= 4

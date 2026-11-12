@@ -94,17 +94,30 @@ namespace rdme {
 
 IntMpdRdmeSolver::IntMpdRdmeSolver()
 :RDMESolver(lm::rng::RandomGenerator::NONE),
- seed(0), tau(0.0),
- cudaOverflowList(NULL), cudaStream(0),
+ seed(0), tau(0.0), reactionModelModified(false),
+ cudaOverflowList(NULL), cudaStream(0), cudaDevice(-1),
  overflowTimesteps(0), overflowListUses(0),
  model_reactionRates(NULL),
- zeroOrder(NULL), firstOrder(NULL), secondOrder(NULL)
+ zeroOrderSize(0), firstOrderSize(0), secondOrderSize(0),
+ zeroOrder(NULL), firstOrder(NULL), secondOrderDeviceTable(),
+#ifdef MPD_GLOBAL_S_MATRIX
+ RLG(NULL), SG(NULL),
+#endif
+#ifdef MPD_GLOBAL_T_MATRIX
+ TG(NULL),
+#endif
+#ifdef MPD_GLOBAL_R_MATRIX
+ reactionRatesG(NULL), reactionOrdersG(NULL), reactionSitesG(NULL), D1G(NULL), D2G(NULL),
+#endif
+ propZeroOrder(NULL), propFirstOrder(NULL), propSecondOrder(NULL),
+ secondOrderRowsG(NULL), secondOrderColumnsG(NULL)
 {
 }
 
 void IntMpdRdmeSolver::initialize(unsigned int replicate, map<string,string> * parameters, ResourceAllocator::ComputeResources * resources)
 {
 	RDMESolver::initialize(replicate, parameters, resources);
+    CUDA_EXCEPTION_CHECK(cudaGetDevice(&cudaDevice));
 
     // Figure out the random seed.
     uint32_t seedTop=(unsigned int)atoi((*parameters)["seed"].c_str());
@@ -130,6 +143,18 @@ void IntMpdRdmeSolver::initialize(unsigned int replicate, map<string,string> * p
 
 IntMpdRdmeSolver::~IntMpdRdmeSolver()
 {
+    // A Python-owned solver can be destroyed after another device becomes
+    // current. Release its buffers and inherited lattice on their owner,
+    // then restore the caller's selection. A never-initialized solver does
+    // not need to contact the CUDA runtime at all.
+    int previousDevice = -1;
+    if (cudaDevice >= 0)
+    {
+        CUDA_EXCEPTION_CHECK_NOTHROW(cudaGetDevice(&previousDevice));
+        if (previousDevice != cudaDevice)
+            CUDA_EXCEPTION_CHECK_NOTHROW(cudaSetDevice(cudaDevice));
+    }
+
     // Free any device memory.
     if (cudaOverflowList != NULL)
     {
@@ -144,12 +169,51 @@ IntMpdRdmeSolver::~IntMpdRdmeSolver()
         cudaStream = NULL;
     }
 
-    // Free allocated memory in IntMpdRdmeSolver
-    if (model_reactionRates)  {delete [] model_reactionRates;}
+    freeDiffusionBuffers();
+    freeReactionBuffers();
+    destroyDiffusionModel();
+    if (previousDevice >= 0 && previousDevice != cudaDevice)
+        CUDA_EXCEPTION_CHECK_NOTHROW(cudaSetDevice(previousDevice));
+}
 
-    if (zeroOrder)   {delete [] zeroOrder;}
-	if (firstOrder)  {delete [] firstOrder;}
-	if (secondOrder) {delete [] secondOrder;}
+void IntMpdRdmeSolver::freeDiffusionBuffers()
+{
+    // Diffusion rebuilds must leave the reaction topology allocated by
+    // buildModel intact. Reset pointers so changing sparse/dense mode cannot
+    // accidentally reuse CSR metadata from the previous model.
+    delete [] model_reactionRates; model_reactionRates = NULL;
+    delete [] zeroOrder; zeroOrder = NULL;
+    delete [] firstOrder; firstOrder = NULL;
+    if (propZeroOrder) { CUDA_EXCEPTION_CHECK_NOTHROW(cudaFree(propZeroOrder)); propZeroOrder = NULL; }
+    if (propFirstOrder) { CUDA_EXCEPTION_CHECK_NOTHROW(cudaFree(propFirstOrder)); propFirstOrder = NULL; }
+    if (propSecondOrder) { CUDA_EXCEPTION_CHECK_NOTHROW(cudaFree(propSecondOrder)); propSecondOrder = NULL; }
+    if (secondOrderRowsG) { CUDA_EXCEPTION_CHECK_NOTHROW(cudaFree(secondOrderRowsG)); secondOrderRowsG = NULL; }
+    if (secondOrderColumnsG) { CUDA_EXCEPTION_CHECK_NOTHROW(cudaFree(secondOrderColumnsG)); secondOrderColumnsG = NULL; }
+#ifdef MPD_GLOBAL_S_MATRIX
+    if (RLG) { CUDA_EXCEPTION_CHECK_NOTHROW(cudaFree(RLG)); RLG = NULL; }
+#endif
+#ifdef MPD_GLOBAL_T_MATRIX
+    if (TG) { CUDA_EXCEPTION_CHECK_NOTHROW(cudaFree(TG)); TG = NULL; }
+#endif
+#ifdef MPD_GLOBAL_R_MATRIX
+    if (reactionRatesG) { CUDA_EXCEPTION_CHECK_NOTHROW(cudaFree(reactionRatesG)); reactionRatesG = NULL; }
+#endif
+    zeroOrderSize = firstOrderSize = secondOrderSize = 0;
+    secondOrderDeviceTable = SecondOrderTableView();
+    secondOrderTable = SecondOrderPropensityTable();
+}
+
+void IntMpdRdmeSolver::freeReactionBuffers()
+{
+#ifdef MPD_GLOBAL_S_MATRIX
+    if (SG) { CUDA_EXCEPTION_CHECK_NOTHROW(cudaFree(SG)); SG = NULL; }
+#endif
+#ifdef MPD_GLOBAL_R_MATRIX
+    if (reactionOrdersG) { CUDA_EXCEPTION_CHECK_NOTHROW(cudaFree(reactionOrdersG)); reactionOrdersG = NULL; }
+    if (reactionSitesG) { CUDA_EXCEPTION_CHECK_NOTHROW(cudaFree(reactionSitesG)); reactionSitesG = NULL; }
+    if (D1G) { CUDA_EXCEPTION_CHECK_NOTHROW(cudaFree(D1G)); D1G = NULL; }
+    if (D2G) { CUDA_EXCEPTION_CHECK_NOTHROW(cudaFree(D2G)); D2G = NULL; }
+#endif
 }
 
 void IntMpdRdmeSolver::allocateLattice(lattice_size_t latticeXSize, lattice_size_t latticeYSize, lattice_size_t latticeZSize, site_size_t particlesPerSite, const unsigned int bytes_per_particle, si_dist_t latticeSpacing)
@@ -178,6 +242,7 @@ void IntMpdRdmeSolver::buildModel(const uint numberSpeciesA,
                                   const uint * DA,
                                   const uint kCols)
 {
+    freeReactionBuffers();
     CMESolver::buildModel(numberSpeciesA, numberReactionsA, initialSpeciesCountsA, reactionTypesA, KA, SA, DA, kCols);
 
     // Get the time step.
@@ -306,6 +371,7 @@ void IntMpdRdmeSolver::buildDiffusionModel(const uint numberSiteTypesA,
                                            const uint8_t * latticeSitesData,
                                            bool rowMajorData)
 {
+    freeDiffusionBuffers();
     RDMESolver::buildDiffusionModel(numberSiteTypesA, DFA, RLA,
                                     latticeXSize, latticeYSize, latticeZSize,
                                     particlesPerSite, bytes_per_particle,
@@ -383,21 +449,71 @@ void IntMpdRdmeSolver::buildDiffusionModel(const uint numberSiteTypesA,
     // Set the cuda reaction model rates now that we have the subvolume size.
     model_reactionRates = new float[numberReactions];
 
-    // Set up pre-configured propensity matrices
-	zeroOrderSize=numberSiteTypes;
-	firstOrderSize=numberSpecies*numberSiteTypes;
-	secondOrderSize=numberSpecies*numberSpecies*numberSiteTypes;
-	zeroOrder=new float[zeroOrderSize];
-	firstOrder=new float[firstOrderSize];
-	secondOrder=new float[secondOrderSize];
+    // Store only pairs that occur in the reaction topology. Keep pairs with
+    // zero rates: hooks may enable them later without rebuilding the lookup.
+    std::vector<SecondOrderPropensityTable::SpeciesPair> reactionPairs;
+    for (uint i=0; i<numberReactions; ++i)
+    {
+        if (reactionTypes[i] == SecondOrderPropensityArgs::REACTION_TYPE)
+        {
+            SecondOrderPropensityArgs* rx = (SecondOrderPropensityArgs*)propensityFunctionArgs[i];
+            reactionPairs.push_back(std::make_pair(rx->s1i, rx->s2i));
+        }
+        else if (reactionTypes[i] == SecondOrderSelfPropensityArgs::REACTION_TYPE)
+        {
+            SecondOrderSelfPropensityArgs* rx = (SecondOrderSelfPropensityArgs*)propensityFunctionArgs[i];
+            reactionPairs.push_back(std::make_pair(rx->si, rx->si));
+        }
+    }
+    std::string secondOrderMode = (*parameters)["intMpdSecondOrderMode"];
+    if (secondOrderMode.empty())
+    {
+        const char* environmentMode = std::getenv("LM_INTMPD_SECOND_ORDER_MODE");
+        secondOrderMode = environmentMode == NULL ? "sparse" : environmentMode;
+    }
+    if (secondOrderMode != "sparse" && secondOrderMode != "dense")
+        throw InvalidArgException("intMpdSecondOrderMode", "Expected sparse or dense");
+    secondOrderTable.initialize(numberSpecies, numberSiteTypes, reactionPairs, secondOrderMode == "sparse");
+    zeroOrderSize = numberSiteTypes;
+    firstOrderSize = SecondOrderPropensityTable::checkedProduct(numberSpecies, numberSiteTypes);
+    secondOrderSize = secondOrderTable.valueCount();
+    zeroOrder = new float[zeroOrderSize];
+    firstOrder = new float[firstOrderSize];
+
+    Print::printf(Print::INFO,
+                  "IntMpd second-order table (%s): %llu bytes per host/device, versus %llu bytes dense; %llu values/site",
+                  secondOrderMode.c_str(),
+                  (unsigned long long)secondOrderTable.storageBytes(),
+                  (unsigned long long)secondOrderTable.denseBytes(),
+                  (unsigned long long)secondOrderTable.view().valuesPerSite);
 
     #ifdef MPD_GLOBAL_R_MATRIX
-    cudaMalloc(&reactionRatesG, numberReactions*sizeof(float));
+    if (numberReactions > 0)
+        CUDA_EXCEPTION_CHECK(cudaMalloc(&reactionRatesG, size_t(numberReactions)*sizeof(float)));
     #endif
-		
-	cudaMalloc(&propZeroOrder, zeroOrderSize*sizeof(float));
-	cudaMalloc(&propFirstOrder, firstOrderSize*sizeof(float));
-	cudaMalloc(&propSecondOrder, secondOrderSize*sizeof(float));
+
+    if (zeroOrderSize > 0)
+        CUDA_EXCEPTION_CHECK(cudaMalloc(&propZeroOrder, zeroOrderSize*sizeof(float)));
+    if (firstOrderSize > 0)
+        CUDA_EXCEPTION_CHECK(cudaMalloc(&propFirstOrder, firstOrderSize*sizeof(float)));
+    if (secondOrderSize > 0)
+        CUDA_EXCEPTION_CHECK(cudaMalloc(&propSecondOrder, secondOrderSize*sizeof(float)));
+    if (!secondOrderTable.rows().empty())
+    {
+        const size_t bytes = secondOrderTable.rows().size()*sizeof(unsigned int);
+        CUDA_EXCEPTION_CHECK(cudaMalloc(&secondOrderRowsG, bytes));
+        CUDA_EXCEPTION_CHECK(cudaMemcpy(secondOrderRowsG, secondOrderTable.rows().data(), bytes, cudaMemcpyHostToDevice));
+    }
+    if (!secondOrderTable.columns().empty())
+    {
+        const size_t bytes = secondOrderTable.columns().size()*sizeof(unsigned int);
+        CUDA_EXCEPTION_CHECK(cudaMalloc(&secondOrderColumnsG, bytes));
+        CUDA_EXCEPTION_CHECK(cudaMemcpy(secondOrderColumnsG, secondOrderTable.columns().data(), bytes, cudaMemcpyHostToDevice));
+    }
+    secondOrderDeviceTable = secondOrderTable.view();
+    secondOrderDeviceTable.values = propSecondOrder;
+    secondOrderDeviceTable.rowOffsets = secondOrderRowsG;
+    secondOrderDeviceTable.columns = secondOrderColumnsG;
 
     computePropensities();
     copyModelsToDevice();
@@ -489,17 +605,15 @@ void IntMpdRdmeSolver::computePropensities()
     }
 
     float scale=latticeXSize*latticeYSize*latticeZSize;
+    secondOrderTable.clear();
 	for(uint site=0; site<numberSiteTypes; site++)
 	{
-		uint o1=site*numberSpecies;
-		uint o2=site*numberSpecies*numberSpecies;
+		const size_t o1=size_t(site)*numberSpecies;
 
 		zeroOrder[site]=0.0f;
 		for (uint i=0; i<numberSpecies; i++)
 		{
 			firstOrder[o1 + i]=0.0f;
-			for (uint j=0; j<numberSpecies; j++)
-				secondOrder[o2 + i*numberSpecies + j]=0.0f;	
 		}
 
 		for (uint i=0; i<numberReactions; i++)
@@ -524,14 +638,13 @@ void IntMpdRdmeSolver::computePropensities()
 				case SecondOrderPropensityArgs::REACTION_TYPE:
 				{
 				    SecondOrderPropensityArgs *rx=(SecondOrderPropensityArgs *)propensityFunctionArgs[i];
-				    secondOrder[o2 + (rx->s1i) * numberSpecies + (rx->s2i)]=rx->k*tau*scale;
-				    secondOrder[o2 + (rx->s2i) * numberSpecies + (rx->s1i)]=rx->k*tau*scale;
+				    secondOrderTable.set(site, rx->s1i, rx->s2i, rx->k*tau*scale);
 				}   break; 
 
 				case SecondOrderSelfPropensityArgs::REACTION_TYPE:
 				{
 				    SecondOrderSelfPropensityArgs *rx=(SecondOrderSelfPropensityArgs *)propensityFunctionArgs[i];
-				    secondOrder[o2 + (rx->si) * numberSpecies + (rx->si)]+=rx->k*tau*scale*2;
+				    secondOrderTable.add(site, rx->si, rx->si, rx->k*tau*scale*2);
 				}
 			}
 		}
@@ -541,14 +654,19 @@ void IntMpdRdmeSolver::computePropensities()
 void IntMpdRdmeSolver::copyModelsToDevice()
 {
 #ifdef MPD_GLOBAL_R_MATRIX
-    cudaMemcpy(reactionRatesG, model_reactionRates, numberReactions*sizeof(float), cudaMemcpyHostToDevice);
+    if (numberReactions > 0)
+        CUDA_EXCEPTION_CHECK(cudaMemcpy(reactionRatesG, model_reactionRates, size_t(numberReactions)*sizeof(float), cudaMemcpyHostToDevice));
 #else
-    CUDA_EXCEPTION_CHECK(cudaMemcpyToSymbol(reactionRatesC, model_reactionRates, numberReactions*sizeof(float)));
+    if (numberReactions > 0)
+        CUDA_EXCEPTION_CHECK(cudaMemcpyToSymbol(reactionRatesC, model_reactionRates, size_t(numberReactions)*sizeof(float)));
 #endif
 
-	cudaMemcpy(propZeroOrder, zeroOrder, zeroOrderSize*sizeof(float), cudaMemcpyHostToDevice);
-	cudaMemcpy(propFirstOrder, firstOrder, firstOrderSize*sizeof(float), cudaMemcpyHostToDevice);
-	cudaMemcpy(propSecondOrder, secondOrder, secondOrderSize*sizeof(float), cudaMemcpyHostToDevice);
+    if (zeroOrderSize > 0)
+        CUDA_EXCEPTION_CHECK(cudaMemcpy(propZeroOrder, zeroOrder, zeroOrderSize*sizeof(float), cudaMemcpyHostToDevice));
+    if (firstOrderSize > 0)
+        CUDA_EXCEPTION_CHECK(cudaMemcpy(propFirstOrder, firstOrder, firstOrderSize*sizeof(float), cudaMemcpyHostToDevice));
+    if (secondOrderSize > 0)
+        CUDA_EXCEPTION_CHECK(cudaMemcpy(propSecondOrder, secondOrderTable.values().data(), secondOrderSize*sizeof(float), cudaMemcpyHostToDevice));
 }
 
 void IntMpdRdmeSolver::generateTrajectory()
@@ -851,7 +969,10 @@ void IntMpdRdmeSolver::runTimestep(CudaIntLattice * lattice, uint32_t timestep)
     PROF_BEGIN(PROF_MPD_TIMESTEP);
 
     if(reactionModelModified)
+    {
         copyModelsToDevice();
+        reactionModelModified = false;
+    }
 
     // Calculate some properties of the lattice.
     lattice_coord_t size = lattice->getSize();
@@ -909,13 +1030,13 @@ void IntMpdRdmeSolver::runTimestep(CudaIntLattice * lattice, uint32_t timestep)
             #ifdef MPD_GLOBAL_S_MATRIX
             #ifdef MPD_GLOBAL_R_MATRIX
                     #ifdef MPD_FREAKYFAST
-                    CUDA_EXCEPTION_EXECUTE((intmpdrdme_dev::precomp_reaction_kernel<<<gridSize,threadBlockSize,0,cudaStream>>>((unsigned int *)lattice->getGPUMemorySrc(), (uint8_t *)lattice->getGPUMemorySiteTypes(), (unsigned int *)lattice->getGPUMemorySrc(), getTimestepSeed(timestep,3), (unsigned int*)cudaOverflowList, SG, RLG, reactionOrdersG, reactionSitesG, D1G, D2G, reactionRatesG, propZeroOrder, propFirstOrder, propSecondOrder)));
+                    CUDA_EXCEPTION_EXECUTE((intmpdrdme_dev::precomp_reaction_kernel<<<gridSize,threadBlockSize,0,cudaStream>>>((unsigned int *)lattice->getGPUMemorySrc(), (uint8_t *)lattice->getGPUMemorySiteTypes(), (unsigned int *)lattice->getGPUMemorySrc(), getTimestepSeed(timestep,3), (unsigned int*)cudaOverflowList, SG, RLG, reactionOrdersG, reactionSitesG, D1G, D2G, reactionRatesG, propZeroOrder, propFirstOrder, secondOrderDeviceTable)));
                     #else
                     CUDA_EXCEPTION_EXECUTE((intmpdrdme_dev::reaction_kernel<<<gridSize,threadBlockSize,0,cudaStream>>>((unsigned int *)lattice->getGPUMemorySrc(), (uint8_t *)lattice->getGPUMemorySiteTypes(), (unsigned int *)lattice->getGPUMemorySrc(), getTimestepSeed(timestep,3), (unsigned int*)cudaOverflowList, SG, RLG, reactionOrdersG, reactionSitesG, D1G, D2G, reactionRatesG)));
                     #endif
             #else
                 #ifdef MPD_FREAKYFAST
-                CUDA_EXCEPTION_EXECUTE((intmpdrdme_dev::precomp_reaction_kernel<<<gridSize,threadBlockSize,0,cudaStream>>>((unsigned int *)lattice->getGPUMemorySrc(), (uint8_t *)lattice->getGPUMemorySiteTypes(), (unsigned int *)lattice->getGPUMemorySrc(), getTimestepSeed(timestep,3), (unsigned int*)cudaOverflowList, SG, RLG, propZeroOrder, propFirstOrder, propSecondOrder)));
+                CUDA_EXCEPTION_EXECUTE((intmpdrdme_dev::precomp_reaction_kernel<<<gridSize,threadBlockSize,0,cudaStream>>>((unsigned int *)lattice->getGPUMemorySrc(), (uint8_t *)lattice->getGPUMemorySiteTypes(), (unsigned int *)lattice->getGPUMemorySrc(), getTimestepSeed(timestep,3), (unsigned int*)cudaOverflowList, SG, RLG, propZeroOrder, propFirstOrder, secondOrderDeviceTable)));
                 #else
                     CUDA_EXCEPTION_EXECUTE((intmpdrdme_dev::reaction_kernel<<<gridSize,threadBlockSize,0,cudaStream>>>((unsigned int *)lattice->getGPUMemorySrc(), (uint8_t *)lattice->getGPUMemorySiteTypes(), (unsigned int *)lattice->getGPUMemorySrc(), getTimestepSeed(timestep,3), (unsigned int*)cudaOverflowList, SG, RLG)));
                 #endif
@@ -1326,9 +1447,9 @@ __global__ void __launch_bounds__(TUNE_MPD_Z_BLOCK_X_SIZE*TUNE_MPD_Z_BLOCK_Z_SIZ
 #ifdef MPD_CUDA_3D_GRID_LAUNCH
 #ifdef MPD_GLOBAL_S_MATRIX
 #ifdef MPD_GLOBAL_R_MATRIX
-__global__ void __launch_bounds__(TUNE_MPD_REACTION_BLOCK_X_SIZE*TUNE_MPD_REACTION_BLOCK_Y_SIZE,1) reaction_kernel(const unsigned int* inLattice, const uint8_t * inSites, unsigned int* outLattice, const unsigned long long timestepHash, unsigned int* siteOverflowList, const __restrict__ int8_t *SG, const __restrict__ uint8_t *RLG, const unsigned int* __restrict__ reactionOrdersG, const unsigned int* __restrict__ reactionSitesG, const unsigned int* __restrict__ D1G, const unsigned int* __restrict__ D2G, const float* __restrict__ reactionRatesG)
+__global__ void __launch_bounds__(TUNE_MPD_REACTION_BLOCK_X_SIZE*TUNE_MPD_REACTION_BLOCK_Y_SIZE,1) reaction_kernel(const unsigned int* inLattice, const uint8_t * inSites, unsigned int* outLattice, const unsigned long long timestepHash, unsigned int* siteOverflowList, const int8_t* __restrict__ SG, const uint8_t* __restrict__ RLG, const unsigned int* __restrict__ reactionOrdersG, const unsigned int* __restrict__ reactionSitesG, const unsigned int* __restrict__ D1G, const unsigned int* __restrict__ D2G, const float* __restrict__ reactionRatesG)
 #else
-__global__ void __launch_bounds__(TUNE_MPD_REACTION_BLOCK_X_SIZE*TUNE_MPD_REACTION_BLOCK_Y_SIZE,1) reaction_kernel(const unsigned int* inLattice, const uint8_t * inSites, unsigned int* outLattice, const unsigned long long timestepHash, unsigned int* siteOverflowList, const __restrict__ int8_t *SG, const __restrict__ uint8_t *RLG)
+__global__ void __launch_bounds__(TUNE_MPD_REACTION_BLOCK_X_SIZE*TUNE_MPD_REACTION_BLOCK_Y_SIZE,1) reaction_kernel(const unsigned int* inLattice, const uint8_t * inSites, unsigned int* outLattice, const unsigned long long timestepHash, unsigned int* siteOverflowList, const int8_t* __restrict__ SG, const uint8_t* __restrict__ RLG)
 #endif
 #else
 __global__ void __launch_bounds__(TUNE_MPD_REACTION_BLOCK_X_SIZE*TUNE_MPD_REACTION_BLOCK_Y_SIZE,1) reaction_kernel(const unsigned int* inLattice, const uint8_t * inSites, unsigned int* outLattice, const unsigned long long timestepHash, unsigned int* siteOverflowList)
@@ -1338,9 +1459,9 @@ __global__ void __launch_bounds__(TUNE_MPD_REACTION_BLOCK_X_SIZE*TUNE_MPD_REACTI
 #else
 #ifdef MPD_GLOBAL_S_MATRIX
 #ifdef MPD_GLOBAL_R_MATRIX
-__global__ void __launch_bounds__(TUNE_MPD_REACTION_BLOCK_X_SIZE*TUNE_MPD_REACTION_BLOCK_Y_SIZE,1) reaction_kernel(const unsigned int* inLattice, const uint8_t * inSites, unsigned int* outLattice, const unsigned int gridXSize, const unsigned long long timestepHash, unsigned int* siteOverflowList, const __restrict__ int8_t *SG, const __restrict__ uint8_t *RLG, const unsigned int* __restrict__ reactionOrdersG, const unsigned int* __restrict__ reactionSitesG, const unsigned int* __restrict__ D1G, const unsigned int* __restrict__ D2G, const float* __restrict__ reactionRatesG)
+__global__ void __launch_bounds__(TUNE_MPD_REACTION_BLOCK_X_SIZE*TUNE_MPD_REACTION_BLOCK_Y_SIZE,1) reaction_kernel(const unsigned int* inLattice, const uint8_t * inSites, unsigned int* outLattice, const unsigned int gridXSize, const unsigned long long timestepHash, unsigned int* siteOverflowList, const int8_t* __restrict__ SG, const uint8_t* __restrict__ RLG, const unsigned int* __restrict__ reactionOrdersG, const unsigned int* __restrict__ reactionSitesG, const unsigned int* __restrict__ D1G, const unsigned int* __restrict__ D2G, const float* __restrict__ reactionRatesG)
 #else
-__global__ void __launch_bounds__(TUNE_MPD_REACTION_BLOCK_X_SIZE*TUNE_MPD_REACTION_BLOCK_Y_SIZE,1) reaction_kernel(const unsigned int* inLattice, const uint8_t * inSites, unsigned int* outLattice, const unsigned int gridXSize, const unsigned long long timestepHash, unsigned int* siteOverflowList, const __restrict__ int8_t *SG, const __restrict__ uint8_t *RLG)
+__global__ void __launch_bounds__(TUNE_MPD_REACTION_BLOCK_X_SIZE*TUNE_MPD_REACTION_BLOCK_Y_SIZE,1) reaction_kernel(const unsigned int* inLattice, const uint8_t * inSites, unsigned int* outLattice, const unsigned int gridXSize, const unsigned long long timestepHash, unsigned int* siteOverflowList, const int8_t* __restrict__ SG, const uint8_t* __restrict__ RLG)
 #endif
 #else
 __global__ void __launch_bounds__(TUNE_MPD_REACTION_BLOCK_X_SIZE*TUNE_MPD_REACTION_BLOCK_Y_SIZE,1) reaction_kernel(const unsigned int* inLattice, const uint8_t * inSites, unsigned int* outLattice, const unsigned int gridXSize, const unsigned long long timestepHash, unsigned int* siteOverflowList)
@@ -1418,9 +1539,9 @@ __global__ void __launch_bounds__(TUNE_MPD_REACTION_BLOCK_X_SIZE*TUNE_MPD_REACTI
 }
 
 #ifdef MPD_GLOBAL_R_MATRIX
-__global__ void __launch_bounds__(TUNE_MPD_REACTION_BLOCK_X_SIZE*TUNE_MPD_REACTION_BLOCK_Y_SIZE,1) precomp_reaction_kernel(const unsigned int* inLattice, const uint8_t * inSites, unsigned int* outLattice, const unsigned long long timestepHash, unsigned int* siteOverflowList, const __restrict__ int8_t *SG, const __restrict__ uint8_t *RLG, const unsigned int* __restrict__ reactionOrdersG, const unsigned int* __restrict__ reactionSitesG, const unsigned int* __restrict__ D1G, const unsigned int* __restrict__ D2G, const float* __restrict__ reactionRatesG, const float* __restrict__ qp0, const float* __restrict__ qp1, const float* __restrict__ qp2)
+__global__ void __launch_bounds__(TUNE_MPD_REACTION_BLOCK_X_SIZE*TUNE_MPD_REACTION_BLOCK_Y_SIZE,1) precomp_reaction_kernel(const unsigned int* inLattice, const uint8_t * inSites, unsigned int* outLattice, const unsigned long long timestepHash, unsigned int* siteOverflowList, const int8_t* __restrict__ SG, const uint8_t* __restrict__ RLG, const unsigned int* __restrict__ reactionOrdersG, const unsigned int* __restrict__ reactionSitesG, const unsigned int* __restrict__ D1G, const unsigned int* __restrict__ D2G, const float* __restrict__ reactionRatesG, const float* __restrict__ qp0, const float* __restrict__ qp1, const SecondOrderTableView secondOrderTable)
 #else
-__global__ void __launch_bounds__(TUNE_MPD_REACTION_BLOCK_X_SIZE*TUNE_MPD_REACTION_BLOCK_Y_SIZE,1) precomp_reaction_kernel(const unsigned int* inLattice, const uint8_t * inSites, unsigned int* outLattice, const unsigned long long timestepHash, unsigned int* siteOverflowList, const __restrict__ int8_t *SG, const __restrict__ uint8_t *RLG, const float* __restrict__ qp0, const float* __restrict__ qp1, const float* __restrict__ qp2)
+__global__ void __launch_bounds__(TUNE_MPD_REACTION_BLOCK_X_SIZE*TUNE_MPD_REACTION_BLOCK_Y_SIZE,1) precomp_reaction_kernel(const unsigned int* inLattice, const uint8_t * inSites, unsigned int* outLattice, const unsigned long long timestepHash, unsigned int* siteOverflowList, const int8_t* __restrict__ SG, const uint8_t* __restrict__ RLG, const float* __restrict__ qp0, const float* __restrict__ qp1, const SecondOrderTableView secondOrderTable)
 #endif
 {
     unsigned int bx=blockIdx.x, by=blockIdx.y, bz=blockIdx.z;
@@ -1457,8 +1578,7 @@ __global__ void __launch_bounds__(TUNE_MPD_REACTION_BLOCK_X_SIZE*TUNE_MPD_REACTI
 				unsigned int p2=particles[j];
 				if(p2 > 0)
 				{
-					totalReactionPropensity += read_element(qp2,siteType*numberSpeciesC*numberSpeciesC + (p1-1)*numberSpeciesC + (p2-1));
-					//totalReactionPropensity += qp2[siteType*numberSpeciesC*numberSpeciesC + (p1-1)*numberSpeciesC + (p2-1)];
+					totalReactionPropensity += secondOrderTable.lookup(siteType, p1, p2);
 				}
 			}
 		}

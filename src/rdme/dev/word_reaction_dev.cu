@@ -59,9 +59,9 @@
 
 #ifdef MPD_GLOBAL_S_MATRIX
 #ifdef MPD_GLOBAL_R_MATRIX
-inline __device__ float calculateReactionPropensity(const uint8_t siteType, const unsigned int * __restrict__ particles, const unsigned int reactionIndex, const uint8_t __restrict__ *RLG, const unsigned int* __restrict__ reactionOrdersG, const unsigned int* __restrict__ reactionSitesG, const unsigned int* __restrict__ D1G, const unsigned int* __restrict__ D2G, const float* __restrict__ reactionRatesG)
+inline __device__ float calculateReactionPropensity(const uint8_t siteType, const unsigned int * __restrict__ particles, const unsigned int reactionIndex, const uint8_t* __restrict__ RLG, const unsigned int* __restrict__ reactionOrdersG, const unsigned int* __restrict__ reactionSitesG, const unsigned int* __restrict__ D1G, const unsigned int* __restrict__ D2G, const float* __restrict__ reactionRatesG)
 #else
-inline __device__ float calculateReactionPropensity(const uint8_t siteType, const unsigned int * __restrict__ particles, const unsigned int reactionIndex, const uint8_t __restrict__ *RLG)
+inline __device__ float calculateReactionPropensity(const uint8_t siteType, const unsigned int * __restrict__ particles, const unsigned int reactionIndex, const uint8_t* __restrict__ RLG)
 #endif
 #else
 inline __device__ float calculateReactionPropensity(const uint8_t siteType, const unsigned int * __restrict__ particles, const unsigned int reactionIndex)
@@ -143,9 +143,9 @@ inline __device__ unsigned int checkForReaction(const unsigned int latticeIndex,
 
 #ifdef MPD_GLOBAL_S_MATRIX
 #ifdef MPD_GLOBAL_R_MATRIX
-inline __device__ unsigned int determineReactionIndex(const uint8_t siteType, const unsigned int * __restrict__ particles, const unsigned int latticeIndex, const float totalReactionPropensity, const unsigned long long timestepHash, const __restrict__ uint8_t *RLG, const unsigned int* __restrict__ reactionOrdersG, const unsigned int* __restrict__ reactionSitesG, const unsigned int* __restrict__ D1G, const unsigned int* __restrict__ D2G, const float* __restrict__ reactionRatesG)
+inline __device__ unsigned int determineReactionIndex(const uint8_t siteType, const unsigned int * __restrict__ particles, const unsigned int latticeIndex, const float totalReactionPropensity, const unsigned long long timestepHash, const uint8_t* __restrict__ RLG, const unsigned int* __restrict__ reactionOrdersG, const unsigned int* __restrict__ reactionSitesG, const unsigned int* __restrict__ D1G, const unsigned int* __restrict__ D2G, const float* __restrict__ reactionRatesG)
 #else
-inline __device__ unsigned int determineReactionIndex(const uint8_t siteType, const unsigned int * __restrict__ particles, const unsigned int latticeIndex, const float totalReactionPropensity, const unsigned long long timestepHash, const __restrict__ uint8_t *RLG)
+inline __device__ unsigned int determineReactionIndex(const uint8_t siteType, const unsigned int * __restrict__ particles, const unsigned int latticeIndex, const float totalReactionPropensity, const unsigned long long timestepHash, const uint8_t* __restrict__ RLG)
 #endif	
 #else
 inline __device__ unsigned int determineReactionIndex(const uint8_t siteType, const unsigned int * __restrict__ particles, const unsigned int latticeIndex, const float totalReactionPropensity, const unsigned long long timestepHash)
@@ -180,77 +180,63 @@ inline __device__ unsigned int determineReactionIndex(const uint8_t siteType, co
 	#else
 	inline __device__ void evaluateReaction(const unsigned int latticeIndex, const uint8_t siteType, unsigned int * __restrict__ particles, const unsigned int reactionIndex, unsigned int * siteOverflowList)
 	#endif
-	{
-
-		int8_t *S;
-		// Copy the S matrix entries for this reaction.
-		#if __CUDA_ARCH__ >= 200
-		S = (int8_t *)malloc(numberSpeciesC);
-		#else
-			#pragma error CUDA_ARCH >= 200 required
-    #endif
-	//for (uint i=0, index=reactionIndex; i<numberSpeciesC; i++, index+=numberReactionsC)
-	for (uint i=0, index=reactionIndex*numberSpeciesC; i<numberSpeciesC; i++, index++)
-	{
-#ifdef MPD_GLOBAL_S_MATRIX
-		S[i] = read_element((char*)SG,index);
-#else
-		S[i] = SC[index];
-#endif
-	}
-
-    // Build the new site, copying particles that didn't react and removing those that did.
-    int nextParticle=0;
-    for (uint i=0; i<MPD_PARTICLES_PER_SITE; i++)
     {
-    	unsigned int particle = particles[i];
-        if (particle > 0)
+    // A reaction can consume at most the particles already in this site.
+    // Remember consumed particle IDs instead of allocating/copying all S
+    // species on the device heap for every firing site. Input survivors keep
+    // their original order, just as when incrementing a private S column.
+    unsigned int removedParticles[MPD_PARTICLES_PER_SITE];
+    unsigned int removedCount = 0;
+    const size_t reactionOffset = size_t(reactionIndex) * numberSpeciesC;
+    unsigned int nextParticle = 0;
+    for (uint i=0; i<MPD_PARTICLES_PER_SITE; ++i)
+    {
+        const unsigned int particle = particles[i];
+        if (particle == 0) continue;
+#ifdef MPD_GLOBAL_S_MATRIX
+        const int change = read_element(SG, reactionOffset + particle - 1);
+#else
+        const int change = SC[reactionOffset + particle - 1];
+#endif
+        if (change < 0)
         {
-        	// If this particle was unaffected, copy it.
-        	if (S[particle-1] >= 0)
-        	{
-        		particles[nextParticle++] = particle;
-        	}
+            unsigned int consumed = 0;
+            for (uint j=0; j<removedCount; ++j)
+                consumed += (removedParticles[j] == particle);
+            if (consumed < static_cast<unsigned int>(-change))
+            {
+                removedParticles[removedCount++] = particle;
+                continue;
+            }
+        }
+        particles[nextParticle++] = particle;
+    }
 
-            // Otherwise, don't copy the particle and mark that we destroyed it.
-        	else
-        	{
-        		S[particle-1]++;
-        	}
+    // Positive stoichiometries are unchanged by reactant consumption. Append
+    // products in the same ascending species order and preserve overflow
+    // insertion order within this site, including a full overflow buffer.
+    for (uint i=0; i<numberSpeciesC; ++i)
+    {
+#ifdef MPD_GLOBAL_S_MATRIX
+        const int change = read_element(SG, reactionOffset + i);
+#else
+        const int change = SC[reactionOffset + i];
+#endif
+        for (int j=0; j<change; ++j)
+        {
+            if (nextParticle < MPD_PARTICLES_PER_SITE)
+                particles[nextParticle++] = i+1;
+            else
+            {
+                const unsigned int exceptionIndex = atomicAdd(siteOverflowList, 1);
+                if (exceptionIndex < TUNE_MPD_MAX_PARTICLE_OVERFLOWS)
+                {
+                    siteOverflowList[exceptionIndex*2+1] = latticeIndex;
+                    siteOverflowList[exceptionIndex*2+2] = i+1;
+                }
+            }
         }
     }
-
-    // Go through the S matrix and add in any new particles that were created.
-    for (uint i=0; i<numberSpeciesC; i++)
-    {
-		for (uint j=0; j<S[i]; j++)
-		{
-			// If the particle will fit into the site, add it.
-			if (nextParticle < MPD_PARTICLES_PER_SITE)
-			{
-				particles[nextParticle++] = i+1;
-			}
-
-			// Otherwise add it to the exception list.
-			else
-			{
-				int exceptionIndex = atomicAdd(siteOverflowList, 1);
-				if (exceptionIndex < TUNE_MPD_MAX_PARTICLE_OVERFLOWS)
-				{
-					siteOverflowList[(exceptionIndex*2)+1]=latticeIndex;
-					siteOverflowList[(exceptionIndex*2)+2]=i+1;
-				}
-			}
-
-		}
-    }
-
-    // Clear any remaining particles in the site.
     while (nextParticle < MPD_PARTICLES_PER_SITE)
-    	particles[nextParticle++] = 0;
-
-    // Free any allocated memory.
-    #if __CUDA_ARCH__ >= 200
-    free(S);
-    #endif
+        particles[nextParticle++] = 0;
 }
